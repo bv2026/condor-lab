@@ -10,10 +10,17 @@ SYMBOLS = {
     'SPY': {'wing_pct': 0.03},    # 3.0% OTM for SPY
     'DIA': {'wing_pct': 0.03},    # 3.0% OTM for DIA (Dow Jones)
     'GLD': {'wing_pct': 0.035},   # 3.5% OTM for GLD
-    'XLP': {'wing_pct': 0.035},   # 3.5% OTM for QQQ
+    'XLP': {'wing_pct': 0.035},   # 3.5% OTM for XLP
     'XLU': {'wing_pct': 0.03},    # 3.0% OTM for XLU
     'IWM': {'wing_pct': 0.035},   # 3.5% OTM for IWM (Russell 2000)
     'SLV': {'wing_pct': 0.04},    # 4.0% OTM for SLV (Silver - volatile)
+    'QQQ': {'wing_pct': 0.03},    # 3.0% OTM for QQQ (Nasdaq 100)
+    'SPX': {'wing_pct': 0.03},    # 3.0% OTM for SPX (S&P 500 index)
+}
+
+# yfinance ticker overrides for symbols whose display name differs from the yfinance ticker.
+YFINANCE_TICKER_MAP = {
+    'SPX': '^GSPC',  # S&P 500 index
 }
 
 # Conservative expiration-availability proxy per symbol.
@@ -34,6 +41,7 @@ SYMBOLS = {
 EXPIRATION_SCHEDULES = {
     'SPY': 'daily',     # Mon/Wed/Fri expirations
     'QQQ': 'daily',     # Mon/Wed/Fri expirations
+    'SPX': 'daily',     # Mon/Wed/Fri expirations (index, cash-settled)
     'IWM': 'daily',     # Mon/Wed/Fri expirations
     'DIA': 'weekly',    # Friday weeklys
     'GLD': 'weekly',    # Friday weeklys
@@ -461,13 +469,14 @@ def fetch_live_iron_condor_credit(symbol, wing_pct, wing_dollars, target_dte_cal
 
 def fetch_symbol_data(symbol):
     """Fetch and return historical data for a symbol + VIX. Returns DataFrame or None."""
-    data = yf.download([symbol, '^VIX'], start=START_DATE, end=END_DATE, progress=False)
+    ticker = YFINANCE_TICKER_MAP.get(symbol, symbol)
+    data = yf.download([ticker, '^VIX'], start=START_DATE, end=END_DATE, progress=False)
     df = pd.DataFrame()
     try:
         if isinstance(data.columns, pd.MultiIndex):
-            df['Close'] = data['Close'][symbol]
-            df['High'] = data['High'][symbol]
-            df['Low'] = data['Low'][symbol]
+            df['Close'] = data['Close'][ticker]
+            df['High'] = data['High'][ticker]
+            df['Low'] = data['Low'][ticker]
             df['VIX'] = data['Close']['^VIX']
         else:
             return None
