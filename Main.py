@@ -758,19 +758,19 @@ def run_all_backtests(daily_entry=False, dte_calendar=7):
     # Sort by total P&L
     all_results.sort(key=lambda x: x['total_pnl'], reverse=True)
 
-    print("\n" + "="*90)
+    print("\n" + "="*103)
     print(f"                    BACKTEST RESULTS SUMMARY - {mode} - {dte_calendar} cal-day DTE")
-    print("="*90)
-    print(f"{'Symbol':<6} {'OTM%':>5} {'Trades':>7} {'WinRate':>8} {'AvgCred':>9} {'R/R':>6} {'MaxDD':>10} {'LoseStrk':>8} {'WinStrk':>8} {'Total P&L':>12}")
-    print("-"*90)
+    print("="*103)
+    print(f"{'Symbol':<6} {'OTM%':>5} {'Trades':>7} {'WinRate':>8} {'AvgCred':>9} {'R/R':>6} {'MaxDD':>10} {'LoseStrk':>8} {'WinStrk':>8} {'CapAlloc':>10} {'Total P&L':>12}")
+    print("-"*103)
 
     for r in all_results:
         verdict = "[+]" if r['total_pnl'] > 0 else "[-]"
         print(f"{r['symbol']:<6} {r['wing_pct']*100:>4.1f}% {r['trades']:>7} {r['win_rate']:>7.1%} "
               f"${r['avg_credit']:>7.0f} {r['risk_reward']:>5.1f}:1 ${r['max_drawdown']:>8.0f} {r['max_losing_streak']:>8} "
-              f"{r['max_winning_streak']:>8} ${r['total_pnl']:>10.0f} {verdict}")
+              f"{r['max_winning_streak']:>8} ${r['avg_max_loss']:>8.0f} ${r['total_pnl']:>10.0f} {verdict}")
 
-    print("-"*90)
+    print("-"*103)
 
     # Find best performer
     best = all_results[0]
