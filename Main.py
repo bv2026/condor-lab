@@ -11,9 +11,9 @@ SYMBOLS = {
     'DIA': {'wing_pct': 0.03},    # 3.0% OTM for DIA (Dow Jones)
     'GLD': {'wing_pct': 0.035},   # 3.5% OTM for GLD
     'XLP': {'wing_pct': 0.035},   # 3.5% OTM for QQQ
-    #'XLU': {'wing_pct': 0.03},    # 3.0% OTM for TLT
-    # 'IWM': {'wing_pct': 0.035},   # 3.5% OTM for IWM (Russell 2000)
-    # 'SLV': {'wing_pct': 0.04},    # 4.0% OTM for SLV (Silver - volatile)
+    'XLU': {'wing_pct': 0.03},    # 3.0% OTM for XLU
+    'IWM': {'wing_pct': 0.035},   # 3.5% OTM for IWM (Russell 2000)
+    'SLV': {'wing_pct': 0.04},    # 4.0% OTM for SLV (Silver - volatile)
 }
 
 # Conservative expiration-availability proxy per symbol.
@@ -107,10 +107,10 @@ def has_viable_expiration(symbol, entry_date, target_dte):
     schedule = EXPIRATION_SCHEDULES.get(symbol, 'monthly')
 
     ideal_expiry = entry_date + timedelta(days=target_dte)
-    ideal_weekday = ideal_expiry.weekday()  # 0=Mon … 4=Fri
+    ideal_weekday = ideal_expiry.weekday()  # 0=Mon ... 4=Fri
 
     if schedule == 'daily':
-        # Mon/Wed/Fri expirations — always within 1 day of any business day
+        # Mon/Wed/Fri expirations - always within 1 day of any business day
         return True
 
     if schedule == 'weekly':
@@ -120,7 +120,7 @@ def has_viable_expiration(symbol, entry_date, target_dte):
         return nearest_gap <= DTE_TOLERANCE
 
     if schedule == 'monthly':
-        # 3rd-Friday-only expirations — check current and adjacent months
+        # 3rd-Friday-only expirations - check current and adjacent months
         y, m = ideal_expiry.year, ideal_expiry.month
         for month_offset in (0, -1, 1):
             adj_m = m + month_offset
@@ -136,7 +136,7 @@ def has_viable_expiration(symbol, entry_date, target_dte):
                 return True
         return False
 
-    # Unknown schedule — conservative default: reject
+    # Unknown schedule - conservative default: reject
     return False
 
 
@@ -256,12 +256,125 @@ def evaluate_position_pnl(symbol, entry_price, current_spot, current_vix, wing_p
     return max(current_value, 0)
 
 
+def fetch_live_iron_condor_credit_ts(symbol, wing_pct, wing_dollars, target_dte_calendar=7):
+    """
+    Fetch LIVE iron condor credit from the TradeStation REST API (v3).
+
+    Requires the TS_ACCESS_TOKEN environment variable (OAuth Bearer token).
+    Set it with:  export TS_ACCESS_TOKEN="<your_token>"
+
+    Returns a details dict identical to fetch_live_iron_condor_credit, or None
+    if the token is missing, a symbol has no viable expiration, or the condor
+    would result in a net debit.
+    """
+    import os
+    import requests as _requests
+
+    token = os.environ.get('TS_ACCESS_TOKEN')
+    if not token:
+        return None  # No token - caller will fall back to yfinance
+
+    BASE = "https://api.tradestation.com/v3"
+    hdrs = {"Authorization": f"Bearer {token}"}
+
+    try:
+        # 1. Spot price
+        resp = _requests.get(f"{BASE}/marketdata/quotes/{symbol}", headers=hdrs, timeout=10)
+        resp.raise_for_status()
+        quotes = resp.json().get('Quotes', [])
+        if not quotes:
+            return None
+        spot = float(quotes[0]['Last'])
+
+        # 2. Option expirations
+        resp = _requests.get(f"{BASE}/marketdata/options/expirations",
+                             params={"underlying": symbol}, headers=hdrs, timeout=10)
+        resp.raise_for_status()
+        expirations = resp.json().get('Expirations', [])
+        if not expirations:
+            return None
+
+        # 3. Find expiration closest to target DTE
+        today = datetime.now()
+        best_exp = min(
+            expirations,
+            key=lambda e: abs((datetime.fromisoformat(e['Date'].replace('Z', '')) - today).days
+                              - target_dte_calendar)
+        )
+        exp_date = datetime.fromisoformat(best_exp['Date'].replace('Z', ''))
+        actual_dte = (exp_date - today).days
+        exp_str = exp_date.strftime('%y%m%d')
+
+        # 4. Compute strikes (same logic as yfinance version)
+        short_put_strike  = round(spot * (1 - wing_pct))
+        long_put_strike   = short_put_strike - wing_dollars
+        short_call_strike = round(spot * (1 + wing_pct))
+        long_call_strike  = short_call_strike + wing_dollars
+
+        sp_sym = f"{symbol} {exp_str}P{int(short_put_strike)}"
+        lp_sym = f"{symbol} {exp_str}P{int(long_put_strike)}"
+        sc_sym = f"{symbol} {exp_str}C{int(short_call_strike)}"
+        lc_sym = f"{symbol} {exp_str}C{int(long_call_strike)}"
+
+        # 5. Option spread quotes
+        resp = _requests.post(
+            f"{BASE}/marketdata/options/quotes",
+            headers=hdrs,
+            json={"Legs": [
+                {"Symbol": sp_sym, "Ratio": -1},
+                {"Symbol": lp_sym, "Ratio":  1},
+                {"Symbol": sc_sym, "Ratio": -1},
+                {"Symbol": lc_sym, "Ratio":  1},
+            ]},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        sq = resp.json().get('Quote', {})
+
+        # Negative Mid means we receive credit (our legs: sell spread)
+        mid = float(sq.get('Mid', 0))
+        total_credit = -mid * 100   # convert to dollars per contract
+
+        if total_credit <= 0:
+            return None             # Net debit - skip
+
+        max_loss = (wing_dollars * 100) - total_credit
+
+        return {
+            'symbol':       symbol,
+            'spot':         spot,
+            'expiration':   exp_date.strftime('%Y-%m-%d'),
+            'dte_calendar': actual_dte,
+            'short_put':    short_put_strike,
+            'long_put':     long_put_strike,
+            'short_call':   short_call_strike,
+            'long_call':    long_call_strike,
+            'put_credit':   0,      # not broken out in spread quote
+            'call_credit':  0,
+            'total_credit': total_credit,
+            'max_loss':     max_loss,
+            'risk_reward':  max_loss / total_credit if total_credit > 0 else 999,
+            'iv':           float(sq.get('ImpliedVolatility', 0)),
+            'source':       'TradeStation',
+        }
+
+    except Exception as e:
+        print(f"  TradeStation error for {symbol}: {e}")
+        return None
+
+
 def fetch_live_iron_condor_credit(symbol, wing_pct, wing_dollars, target_dte_calendar=7):
     """
-    Fetch LIVE options data from yfinance to get real iron condor credit.
+    Fetch LIVE options data to get real iron condor credit.
+    Uses TradeStation REST API when TS_ACCESS_TOKEN env var is set,
+    falls back to yfinance otherwise.
     target_dte_calendar: target days to expiration in calendar days
     Returns: details_dict or None if failed
     """
+    # Try TradeStation first (richer data, real-time)
+    ts_result = fetch_live_iron_condor_credit_ts(symbol, wing_pct, wing_dollars, target_dte_calendar)
+    if ts_result is not None:
+        return ts_result
     try:
         ticker = yf.Ticker(symbol)
         spot = ticker.history(period='1d')['Close'].iloc[-1]
@@ -560,11 +673,14 @@ def run_backtest_single(symbol, wing_pct, daily_entry=False, dte_calendar=7, df=
 
 def fetch_live_quotes():
     """Fetch live options quotes for all symbols."""
-    print("\n" + "="*70)
-    print("              LIVE OPTIONS QUOTES (Current Market)")
-    print("="*70)
-    print(f"{'Symbol':<8} {'Spot':>10} {'Exp':>12} {'DTE':>5} {'Credit':>10} {'MaxLoss':>10} {'R/R':>8}")
-    print("-"*70)
+    import os
+    source_label = "TradeStation" if os.environ.get('TS_ACCESS_TOKEN') else "yfinance"
+
+    print("\n" + "="*80)
+    print(f"              LIVE OPTIONS QUOTES  [source: {source_label}]")
+    print("="*80)
+    print(f"{'Symbol':<8} {'Spot':>10} {'Exp':>12} {'DTE':>5} {'Credit':>10} {'MaxLoss':>10} {'R/R':>7} {'IV':>7}")
+    print("-"*80)
 
     live_results = []
 
@@ -573,20 +689,25 @@ def fetch_live_quotes():
         details = fetch_live_iron_condor_credit(symbol, wing_pct, WING_WIDTH_DOLLARS, TARGET_DTE_CALENDAR)
 
         if details:
+            iv_str = f"{details.get('iv', 0)*100:5.1f}%" if details.get('iv') else "  n/a"
             print(f"{symbol:<8} ${details['spot']:>8.2f} {details['expiration']:>12} {details['dte_calendar']:>5} "
-                  f"${details['total_credit']:>8.2f} ${details['max_loss']:>8.2f} {details['risk_reward']:>7.1f}:1")
+                  f"${details['total_credit']:>8.2f} ${details['max_loss']:>8.2f} "
+                  f"{details['risk_reward']:>6.1f}:1 {iv_str:>7}")
             live_results.append(details)
         else:
-            print(f"{symbol:<8} {'ERROR - No options data available':>60}")
+            print(f"{symbol:<8} {'ERROR - No options data available':<60}")
 
-    print("-"*70)
+    print("-"*80)
 
-    # Find best opportunity
+    # Find best opportunity (lowest R/R = most efficient credit)
     if live_results:
         best = min(live_results, key=lambda x: x['risk_reward'])
-        print(f"\n🏆 BEST OPPORTUNITY: {best['spot']:.2f} - Risk/Reward {best['risk_reward']:.1f}:1")
-        print(f"   Credit: ${best['total_credit']:.2f} | Max Loss: ${best['max_loss']:.2f}")
-        print(f"   Strikes: {best['long_put']:.0f}/{best['short_put']:.0f} - {best['short_call']:.0f}/{best['long_call']:.0f}")
+        sym = best.get('symbol', '')
+        print(f"\nBEST: {sym}  Spot ${best['spot']:.2f}  |  Credit ${best['total_credit']:.2f}"
+              f"  |  Max Loss ${best['max_loss']:.2f}  |  R/R {best['risk_reward']:.1f}:1")
+        print(f"   Strikes: {best['long_put']:.0f}/{best['short_put']:.0f}"
+              f" x {best['short_call']:.0f}/{best['long_call']:.0f}"
+              f"   Exp: {best['expiration']}  ({best['dte_calendar']} DTE)")
 
     return live_results
 
@@ -605,7 +726,7 @@ def run_all_backtests(daily_entry=False, dte_calendar=7):
     print(f"Stop Loss Mode: {STOP_LOSS_MODE}")
     if daily_entry:
         trading_days_approx = max(1, round(dte_calendar * 5 / 7))
-        print(f"⚠️  Max Concurrent Positions: Up to {trading_days_approx} overlapping trades")
+        print(f"WARNING:  Max Concurrent Positions: Up to {trading_days_approx} overlapping trades")
     print("-"*90)
     print("Fetching historical data...")
 
@@ -631,7 +752,7 @@ def run_all_backtests(daily_entry=False, dte_calendar=7):
     print("-"*90)
 
     for r in all_results:
-        verdict = "✅" if r['total_pnl'] > 0 else "❌"
+        verdict = "[+]" if r['total_pnl'] > 0 else "[-]"
         print(f"{r['symbol']:<6} {r['wing_pct']*100:>4.1f}% {r['trades']:>7} {r['win_rate']:>7.1%} "
               f"${r['avg_credit']:>7.0f} {r['risk_reward']:>5.1f}:1 ${r['max_drawdown']:>8.0f} {r['max_losing_streak']:>8} "
               f"{r['max_winning_streak']:>8} ${r['total_pnl']:>10.0f} {verdict}")
@@ -640,7 +761,7 @@ def run_all_backtests(daily_entry=False, dte_calendar=7):
 
     # Find best performer
     best = all_results[0]
-    print(f"\n🏆 BEST BACKTEST: {best['symbol']}")
+    print(f"\nBEST: BEST BACKTEST: {best['symbol']}")
     print(f"   Win Rate: {best['win_rate']:.1%} | Avg Credit: ${best['avg_credit']:.2f}")
     print(f"   Risk/Reward: {best['risk_reward']:.1f}:1 | Total P&L: ${best['total_pnl']:.2f}")
     print(f"   Max Drawdown: ${best['max_drawdown']:.2f} | Max Losing Streak: {best['max_losing_streak']} | Max Winning Streak: {best['max_winning_streak']}")
@@ -651,7 +772,7 @@ def run_all_backtests(daily_entry=False, dte_calendar=7):
         trading_days_approx = max(1, round(dte_calendar * 5 / 7))
         max_concurrent = trading_days_approx
         max_capital_needed = max_risk_per_trade * max_concurrent
-        print(f"\n💰 CAPITAL REQUIREMENTS (for {best['symbol']}):")
+        print(f"\n CAPITAL REQUIREMENTS (for {best['symbol']}):")
         print(f"   Max Risk per Trade: ${max_risk_per_trade:.2f}")
         print(f"   Max Concurrent Positions: {max_concurrent}")
         print(f"   Max Capital at Risk: ${max_capital_needed:.2f}")
@@ -719,11 +840,11 @@ def run_dte_comparison(daily_entry=True):
     print("-"*90)
 
     # Summary
-    print("\n🏆 OPTIMAL DTE PER SYMBOL (calendar days):")
+    print("\nBEST: OPTIMAL DTE PER SYMBOL (calendar days):")
     for symbol, dte_calendar in best_dte_per_symbol.items():
         if dte_calendar and symbol in all_dte_results[dte_calendar]:
             r = all_dte_results[dte_calendar][symbol]
-            print(f"   {symbol}: {dte_calendar} cal-day DTE → P&L ${r['total_pnl']:.0f} | Win Rate {r['win_rate']:.1%} | Max DD ${r['max_drawdown']:.0f}")
+            print(f"   {symbol}: {dte_calendar} cal-day DTE -> P&L ${r['total_pnl']:.0f} | Win Rate {r['win_rate']:.1%} | Max DD ${r['max_drawdown']:.0f}")
 
     # Find overall best combination
     best_overall = None
@@ -737,7 +858,7 @@ def run_dte_comparison(daily_entry=True):
 
     if best_overall:
         symbol, dte_calendar, r = best_overall
-        print(f"\n🥇 BEST OVERALL: {symbol} @ {dte_calendar} cal-day DTE")
+        print(f"\n BEST OVERALL: {symbol} @ {dte_calendar} cal-day DTE")
         print(f"   Total P&L: ${r['total_pnl']:.2f}")
         print(f"   Win Rate: {r['win_rate']:.1%}")
         print(f"   Max Drawdown: ${r['max_drawdown']:.2f}")
@@ -761,6 +882,7 @@ def run_parameter_sweep(daily_entry=False):
     print("Fetching historical data...")
 
     best_per_symbol = {}
+    all_sweep_results = []
 
     for symbol in SYMBOLS.keys():
         symbol_results = []
@@ -780,6 +902,8 @@ def run_parameter_sweep(daily_entry=False):
         if not symbol_results:
             print(f"\n{symbol}: No results found for any parameter combination.")
             continue
+
+        all_sweep_results.extend(symbol_results)
 
         # Score: balance profit and losing streak using exponential decay
         # Each additional loss in the streak reduces the score by ~15%
@@ -825,80 +949,136 @@ def run_parameter_sweep(daily_entry=False):
         print(f"\n  Overall Best: {overall_best_symbol} @ {ob['wing_pct']*100:.1f}% wings, {ob['dte_calendar']} cal-day DTE")
         print(f"  P&L: ${ob['total_pnl']:.0f} | Win Rate: {ob['win_rate']:.1%} | Max DD: ${ob['max_drawdown']:.0f}")
 
-    return best_per_symbol
+    return best_per_symbol, all_sweep_results
+
+
+def export_to_file(df, name, use_excel=False):
+    """Export DataFrame to Excel (.xlsx) or CSV. Falls back to CSV if openpyxl is missing."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if use_excel:
+        try:
+            import openpyxl  # noqa: F401
+            path = f"{name}_{timestamp}.xlsx"
+            df.to_excel(path, index=False)
+            print(f"  Exported: {path}")
+            return
+        except ImportError:
+            print("  openpyxl not available, falling back to CSV")
+    path = f"{name}_{timestamp}.csv"
+    df.to_csv(path, index=False)
+    print(f"  Exported: {path}")
 
 
 # Run it
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if len(sys.argv) > 1 and sys.argv[1] == '--live':
-        # Fetch live quotes only
-        fetch_live_quotes()
+    parser = argparse.ArgumentParser(
+        description="Iron Condor Backtesting & Live Quote Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python Main.py                          # weekly backtest (default)\n"
+            "  python Main.py --backtest --daily       # daily-entry backtest\n"
+            "  python Main.py --backtest --daily --export\n"
+            "  python Main.py --dte --daily            # DTE comparison, daily entry\n"
+            "  python Main.py --sweep --export         # parameter sweep + export\n"
+            "  python Main.py --sweep --daily --export\n"
+            "  python Main.py --compare                # weekly vs daily comparison\n"
+            "  python Main.py --live                   # live market quotes\n"
+        ),
+    )
 
-    elif len(sys.argv) > 1 and sys.argv[1] == '--daily':
-        # Run daily entry backtest with default 7 calendar-day DTE
-        run_all_backtests(daily_entry=True, dte_calendar=7)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--backtest", action="store_true",
+                      help="Run backtest for all configured symbols (default)")
+    mode.add_argument("--dte",      action="store_true",
+                      help="Compare multiple DTE holding periods side-by-side")
+    mode.add_argument("--sweep",    action="store_true",
+                      help="Grid-search wing%% x DTE parameter combinations")
+    mode.add_argument("--compare",  action="store_true",
+                      help="Run weekly and daily backtests and print comparison table")
+    mode.add_argument("--live",     action="store_true",
+                      help="Fetch current market option quotes (no backtest)")
 
-    elif len(sys.argv) > 1 and sys.argv[1] == '--dte':
-        # Compare different DTE values
-        run_dte_comparison(daily_entry=True)
+    parser.add_argument("--daily",  action="store_true",
+                        help="Use daily entry (overlapping positions). Composable with "
+                             "--backtest, --dte, and --sweep.")
+    parser.add_argument("--export", action="store_true",
+                        help="Save results to Excel (.xlsx) or CSV if openpyxl is unavailable")
 
-    elif len(sys.argv) > 1 and sys.argv[1] == '--compare':
-        # Compare weekly vs daily
-        print("\n" + "🔄"*35)
+    args = parser.parse_args()
+
+    if args.live:
+        results = fetch_live_quotes()
+        if args.export and results:
+            export_to_file(pd.DataFrame(results), "live_quotes", use_excel=True)
+
+    elif args.dte:
+        all_dte_results = run_dte_comparison(daily_entry=args.daily)
+        if args.export and all_dte_results:
+            rows = [r for dte_dict in all_dte_results.values() for r in dte_dict.values()]
+            if rows:
+                export_to_file(pd.DataFrame(rows), "dte_comparison", use_excel=True)
+
+    elif args.sweep:
+        best_per_symbol, all_sweep_results = run_parameter_sweep(daily_entry=args.daily)
+        if args.export and all_sweep_results:
+            export_to_file(pd.DataFrame(all_sweep_results), "sweep_results", use_excel=True)
+
+    elif args.compare:
+        print("\n" + "=" * 70)
         print("         COMPARING WEEKLY vs DAILY ENTRY STRATEGIES")
-        print("🔄"*35 + "\n")
+        print("=" * 70 + "\n")
 
-        print("\n📅 WEEKLY ENTRY (Friday only, 1 position at a time):")
+        print("\nWEEKLY ENTRY (Friday only, 1 position at a time):")
         weekly_results = run_all_backtests(daily_entry=False, dte_calendar=7)
 
-        print("\n\n📆 DAILY ENTRY (Every day, up to 5 overlapping positions):")
+        print("\n\nDAILY ENTRY (Every day, up to 5 overlapping positions):")
         daily_results = run_all_backtests(daily_entry=True, dte_calendar=7)
 
-        # Summary comparison
         if weekly_results and daily_results:
-            print("\n" + "="*90)
+            print("\n" + "=" * 90)
             print("                    WEEKLY vs DAILY COMPARISON")
-            print("="*90)
-            print(f"{'Symbol':<8} {'Weekly P&L':>12} {'Daily P&L':>12} {'Mult':>6} {'Wkly MaxDD':>12} {'Daily MaxDD':>12}")
-            print("-"*90)
+            print("=" * 90)
+            print(f"{'Symbol':<8} {'Weekly P&L':>12} {'Daily P&L':>12} {'Mult':>6} "
+                  f"{'Wkly MaxDD':>12} {'Daily MaxDD':>12}")
+            print("-" * 90)
 
+            compare_rows = []
             for w in weekly_results:
                 d = next((x for x in daily_results if x['symbol'] == w['symbol']), None)
                 if d:
                     mult = d['total_pnl'] / w['total_pnl'] if w['total_pnl'] != 0 else 0
-                    print(f"{w['symbol']:<8} ${w['total_pnl']:>10.0f} ${d['total_pnl']:>10.0f} {mult:>5.1f}x "
-                          f"${w['max_drawdown']:>10.0f} ${d['max_drawdown']:>10.0f}")
-            print("-"*90)
+                    print(f"{w['symbol']:<8} ${w['total_pnl']:>10.0f} ${d['total_pnl']:>10.0f} "
+                          f"{mult:>5.1f}x ${w['max_drawdown']:>10.0f} ${d['max_drawdown']:>10.0f}")
+                    compare_rows.append({
+                        'symbol': w['symbol'],
+                        'weekly_pnl': w['total_pnl'],
+                        'daily_pnl': d['total_pnl'],
+                        'multiplier': mult,
+                        'weekly_max_drawdown': w['max_drawdown'],
+                        'daily_max_drawdown': d['max_drawdown'],
+                    })
+            print("-" * 90)
 
-    elif len(sys.argv) > 1 and sys.argv[1] == '--full':
-        # Full analysis: DTE comparison + live quotes
-        run_dte_comparison(daily_entry=True)
-        fetch_live_quotes()
-
-    elif len(sys.argv) > 1 and sys.argv[1] == '--both':
-        # Run both backtest and live quotes
-        run_all_backtests(daily_entry=True, dte_calendar=7)
-        fetch_live_quotes()
-
-    elif len(sys.argv) > 1 and sys.argv[1] == '--sweep':
-        # Parameter sweep: wing_pct x DTE grid search (weekly entry)
-        run_parameter_sweep(daily_entry=False)
-
-    elif len(sys.argv) > 1 and sys.argv[1] == '--sweep-daily':
-        # Parameter sweep with daily entry (matches live bot behavior)
-        run_parameter_sweep(daily_entry=True)
+            if args.export and compare_rows:
+                export_to_file(pd.DataFrame(compare_rows), "compare_weekly_daily", use_excel=True)
 
     else:
-        # Default: run weekly backtests
-        run_all_backtests(dte_calendar=7)
-        print("\n💡 Options:")
-        print("   --daily   : Trade every day (overlapping positions)")
-        print("   --compare : Compare weekly vs daily strategies")
-        print("   --dte     : Compare 5, 7, 10 DTE holding periods")
-        print("   --full    : Full analysis (DTE comparison + live quotes)")
-        print("   --live    : Current market quotes only")
-        print("   --both    : Daily backtest + live quotes")
-        print("   --sweep   : Sweep wing% x DTE to find optimal parameters (weekly)")
-        print("   --sweep-daily : Same sweep but with daily entry (matches live bot)")
+        # Default: backtest (handles both explicit --backtest and bare invocation)
+        results = run_all_backtests(daily_entry=args.daily, dte_calendar=7)
+        if args.export and results:
+            export_to_file(pd.DataFrame(results), "backtest_results", use_excel=True)
+
+        if not args.backtest:
+            print("\nOptions:")
+            print("  python Main.py [--backtest | --dte | --sweep | --compare | --live] [--daily] [--export]")
+            print()
+            print("  --backtest  Run backtest for all symbols (default)")
+            print("  --dte       Compare DTE holding periods side-by-side")
+            print("  --sweep     Grid-search wing% x DTE parameter combinations")
+            print("  --compare   Compare weekly vs daily entry strategies")
+            print("  --live      Fetch live market quotes (no backtest)")
+            print("  --daily     Daily entry - composable with backtest / dte / sweep")
+            print("  --export    Save results to Excel (.xlsx) or CSV")
