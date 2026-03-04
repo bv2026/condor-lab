@@ -7,15 +7,15 @@ from datetime import datetime, timedelta
 # --- STRATEGY SETTINGS (Tweak these to test!) ---
 # Multiple symbols with their specific settings
 SYMBOLS = {
-    'SPY': {'wing_pct': 0.03},    # 3.0% OTM for SPY
-    'DIA': {'wing_pct': 0.03},    # 3.0% OTM for DIA (Dow Jones)
-    'GLD': {'wing_pct': 0.035},   # 3.5% OTM for GLD
-    'XLP': {'wing_pct': 0.035},   # 3.5% OTM for XLP
-    'XLU': {'wing_pct': 0.03},    # 3.0% OTM for XLU
-    'IWM': {'wing_pct': 0.035},   # 3.5% OTM for IWM (Russell 2000)
-    'SLV': {'wing_pct': 0.04},    # 4.0% OTM for SLV (Silver - volatile)
-    'QQQ': {'wing_pct': 0.03},    # 3.0% OTM for QQQ (Nasdaq 100)
-    'SPX': {'wing_pct': 0.03},    # 3.0% OTM for SPX (S&P 500 index)
+    'SPY': {'wing_pct': 0.03,  'fees_per_contract': 0.75},  # 3.0% OTM; $0.75/contract x4 legs
+    'DIA': {'wing_pct': 0.03,  'fees_per_contract': 0.75},  # 3.0% OTM for DIA (Dow Jones)
+    'GLD': {'wing_pct': 0.035, 'fees_per_contract': 0.75},  # 3.5% OTM for GLD
+    'XLP': {'wing_pct': 0.035, 'fees_per_contract': 0.75},  # 3.5% OTM for XLP
+    'XLU': {'wing_pct': 0.03,  'fees_per_contract': 0.75},  # 3.0% OTM for XLU
+    'IWM': {'wing_pct': 0.035, 'fees_per_contract': 0.75},  # 3.5% OTM for IWM (Russell 2000)
+    'SLV': {'wing_pct': 0.04,  'fees_per_contract': 0.75},  # 4.0% OTM for SLV (Silver - volatile)
+    'QQQ': {'wing_pct': 0.03,  'fees_per_contract': 0.75},  # 3.0% OTM for QQQ (Nasdaq 100)
+    'SPX': {'wing_pct': 0.03,  'fees_per_contract': 7.50},  # 3.0% OTM for SPX; $7.50/contract x4 legs
 }
 
 # yfinance ticker overrides for symbols whose display name differs from the yfinance ticker.
@@ -493,6 +493,9 @@ def run_backtest_single(symbol, wing_pct, daily_entry=False, dte_calendar=7, df=
     df: Pre-fetched DataFrame (optional, avoids redundant downloads in sweep mode)
     """
 
+    # Per-trade fee deduction: fees_per_contract * 4 legs per iron condor
+    fees_per_trade = SYMBOLS.get(symbol, {}).get('fees_per_contract', 0.0) * 4
+
     # Fetch Data if not provided
     if df is None:
         df = fetch_symbol_data(symbol)
@@ -600,17 +603,18 @@ def run_backtest_single(symbol, wing_pct, daily_entry=False, dte_calendar=7, df=
                 else:
                     raise ValueError(f"Unknown STOP_LOSS_MODE: {STOP_LOSS_MODE}")
 
+            net_pnl = pnl - fees_per_trade  # deduct round-trip fees (open + close, 4 legs)
             trades.append({
                 'Date': date,
                 'ExitDate': exit_date,
                 'Result': result,
-                'P&L': pnl,
+                'P&L': net_pnl,
                 'Credit': estimated_credit,
                 'MaxLoss': max_loss
             })
             total_credits.append(estimated_credit)
             total_max_losses.append(max_loss)
-            pnl_entry_order.append(pnl)
+            pnl_entry_order.append(net_pnl)
 
         except:
             continue
